@@ -174,6 +174,27 @@ static bool decodeHexText(const std::string& text, uint8_t *output, size_t outpu
   return true;
 }
 
+static void logBLEReceivedData(const char *label, const std::string &data) {
+  Serial.printf("%s: length=%u\n", label, (unsigned)data.length());
+  if (data.empty()) return;
+
+  Serial.print("  RAW HEX: ");
+  for (unsigned char c : data) {
+    Serial.printf("%02X", c);
+  }
+  Serial.println();
+
+  Serial.print("  RAW ASCII: ");
+  for (unsigned char c : data) {
+    if (isprint(c)) {
+      Serial.write(c);
+    } else {
+      Serial.print('.');
+    }
+  }
+  Serial.println();
+}
+
 // Current output-to-motion mapping (indices into OUTPUT_PINS[])
 // Defaults match the legacy hardcoded assignments
 uint8_t outIdxEstop = 0;  // R0_0
@@ -455,7 +476,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
 class AuthCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     std::string data = pCharacteristic->getValue();
-    Serial.printf("Auth data received: %s\n", data.c_str());
+    logBLEReceivedData("AUTH write received", data);
     if (data.length() < 3) {
       authChar->setValue("AUTH_FAIL");
       authChar->notify();
@@ -515,6 +536,7 @@ class DigitalCallbacks : public BLECharacteristicCallbacks {
     }
 
     std::string value = pCharacteristic->getValue();
+    logBLEReceivedData("DIGITAL write received", value);
     if (value.length() < 1) return;
 
     // Decrypt using AES-GCM (accepts hex text or raw bytes: IV(12) | CIPHER | TAG(16))
