@@ -46,7 +46,7 @@ const OutPin OUTPUT_PINS[NUM_OUTPUT_PINS] = {
   { "Q0_2", Q0_2 },
   { "Q0_3", Q0_3 }
 };
-
+// aes key must be 16 bytes for AES-128
 static const uint8_t aesKey[16] = {
   0x54, 0x55, 0x53, 0x4B,
   0x45, 0x52, 0x5F, 0x52,
