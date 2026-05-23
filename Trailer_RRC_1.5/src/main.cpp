@@ -87,8 +87,11 @@ static bool decryptAESGCM_from_bytes(const uint8_t *encrypted, size_t encryptedL
   return true;
 }
 
-// forward declare decodeHexText (defined later)
+// forward declare helpers defined later
 static bool decodeHexText(const std::string& text, uint8_t *output, size_t outputSize, size_t *outputLen);
+static uint64_t read48be(const uint8_t *buf);
+static bool isCounterFresh(uint64_t sessionId, uint64_t counter);
+static void updateLastCounter(uint64_t sessionId, uint64_t counter);
 
 static bool decodePayload(const std::string &data, uint8_t *output, size_t outputSize, size_t *outputLen) {
   if (decodeHexText(data, output, outputSize, outputLen)) {
@@ -161,6 +164,33 @@ static void updateLastCounter(uint64_t sessionId, uint64_t counter) {
   sessionCounters[target].used = true;
   sessionCounters[target].sessionId = sessionId;
   sessionCounters[target].lastCounter = counter;
+}
+
+static bool decryptAndValidateEncryptedPayload(const std::string &value, uint8_t *decrypted, size_t *decryptedLen, uint64_t &sessionId, uint64_t &counter) {
+  uint8_t encrypted[256];
+  size_t encryptedLen = 0;
+
+  if (!decodePayload(value, encrypted, sizeof(encrypted), &encryptedLen)) {
+    return false;
+  }
+
+  if (encryptedLen < 12 + 16) {
+    return false;
+  }
+
+  sessionId = read48be(encrypted);
+  counter   = read48be(encrypted + 6);
+
+  if (!isCounterFresh(sessionId, counter)) {
+    return false;
+  }
+
+  if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, decryptedLen)) {
+    return false;
+  }
+
+  updateLastCounter(sessionId, counter);
+  return true;
 }
 
 static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted, size_t *decryptedLen) {
@@ -720,20 +750,29 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
       Serial.println("Heartbeat characteristic received EMPTY data");
       return;
     }
-    
-    //Serial.printf("✓ Heartbeat characteristic RECEIVED: '%s' (length: %d)\n", data.c_str(), data.length());
-    
-    if (data != "HB") {
-      Serial.printf("✗ Invalid heartbeat payload (expected 'HB'): '%s'\n", data.c_str());
+
+    uint8_t decrypted[32];
+    size_t decryptedLen = 0;
+    uint64_t sessionId = 0;
+    uint64_t counter = 0;
+
+    if (!decryptAndValidateEncryptedPayload(data, decrypted, &decryptedLen, sessionId, counter)) {
+      return;
+    }
+
+    // Trim trailing nulls if any
+    while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
+    if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
+    decrypted[decryptedLen] = '\0';
+
+    if (strcmp(reinterpret_cast<char*>(decrypted), "HB") != 0) {
       return;
     }
 
     lastHeartbeatTime = millis();
-    //Serial.printf("✓ Heartbeat received @ %lums\n", lastHeartbeatTime);
     heartbeatMissCount = 0;
     if (!heartbeatAlive) {
       heartbeatAlive = true;
-      Serial.println("Heartbeat restored — outputs enabled if command state allows");
     }
     updateOutputPinsFromState();
   }
