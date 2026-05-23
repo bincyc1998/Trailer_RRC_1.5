@@ -93,6 +93,67 @@ static uint64_t read48be(const uint8_t *buf);
 static bool isCounterFresh(uint64_t sessionId, uint64_t counter);
 static void updateLastCounter(uint64_t sessionId, uint64_t counter);
 
+// Global IV counter for encrypting replies (12 bytes)
+static uint8_t replyIvCounter[12] = {0};
+
+static void incrementReplyIv() {
+  for (int i = 11; i >= 0; --i) {
+    replyIvCounter[i]++;
+    if (replyIvCounter[i] != 0) break;
+  }
+}
+
+static std::string bytesToHex(const uint8_t *data, size_t len) {
+  static const char hexDigits[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(len * 2);
+  for (size_t i = 0; i < len; ++i) {
+    out.push_back(hexDigits[(data[i] >> 4) & 0xF]);
+    out.push_back(hexDigits[data[i] & 0xF]);
+  }
+  return out;
+}
+
+// Encrypt plaintext into IV(12)|CIPHER|TAG(16) hex string (IV is replyIvCounter, incremented)
+static bool encryptAESGCM_packet(const std::string &plain, std::string &outHex) {
+  size_t len = plain.size();
+  if (len > 200) return false;
+
+  uint8_t ciphertext[256];
+  uint8_t tag[16];
+
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aesKey, 128) != 0) {
+    mbedtls_gcm_free(&gcm);
+    return false;
+  }
+
+  incrementReplyIv();
+
+  int res = mbedtls_gcm_crypt_and_tag(
+    &gcm,
+    MBEDTLS_GCM_ENCRYPT,
+    len,
+    replyIvCounter, 12,
+    NULL, 0,
+    (const uint8_t*)plain.data(),
+    ciphertext,
+    16,
+    tag
+  );
+
+  mbedtls_gcm_free(&gcm);
+  if (res != 0) return false;
+
+  // Build final hex: IV + ciphertext + tag
+  outHex.clear();
+  outHex += bytesToHex(replyIvCounter, 12);
+  outHex += bytesToHex(ciphertext, len);
+  outHex += bytesToHex(tag, 16);
+  return true;
+}
+
 static bool decodePayload(const std::string &data, uint8_t *output, size_t outputSize, size_t *outputLen) {
   if (decodeHexText(data, output, outputSize, outputLen)) {
     return true;
@@ -558,45 +619,134 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
 class AuthCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
+    // Accept encrypted auth payload: IV(12) | CIPHER | TAG(16) encoded as hex or raw
     std::string data = pCharacteristic->getValue();
     logBLEReceivedData("AUTH write received", data);
-    if (data.length() < 3) {
-      authChar->setValue("AUTH_FAIL");
-      authChar->notify();
+
+    if (data.length() < 1) {
+      Serial.println("Auth: empty payload");
+      return;
+    }
+
+    // Decode encrypted packet
+    uint8_t encrypted[512];
+    size_t encryptedLen = 0;
+    if (!decodePayload(data, encrypted, sizeof(encrypted), &encryptedLen)) {
+      Serial.println("Auth: payload decode failed");
+      // Reply encrypted FAIL
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+        Serial.println("Auth: sent AUTH_FAIL (encrypted)");
+      }
       delay(200);
       pBLEServer->disconnect(connId);
       return;
     }
 
-    // Split on '|'
-    size_t sep = data.find('|');
+    Serial.printf("Auth: decoded encrypted length=%u\n", (unsigned)encryptedLen);
+
+    if (encryptedLen < 12 + 16) {
+      Serial.println("Auth: encrypted payload too short");
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
+      delay(200);
+      pBLEServer->disconnect(connId);
+      return;
+    }
+
+    uint64_t sessionId = read48be(encrypted);
+    uint64_t counter   = read48be(encrypted + 6);
+    Serial.printf("Auth: IV sessionId=%012llX counter=%llu\n", (unsigned long long)sessionId, (unsigned long long)counter);
+
+    if (!isCounterFresh(sessionId, counter)) {
+      Serial.println("Auth: counter replay/stale");
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
+      delay(200);
+      pBLEServer->disconnect(connId);
+      return;
+    }
+
+    uint8_t decrypted[256];
+    size_t decryptedLen = 0;
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+      Serial.println("Auth: AES-GCM decryption failed");
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
+      delay(200);
+      pBLEServer->disconnect(connId);
+      return;
+    }
+
+    updateLastCounter(sessionId, counter);
+
+    // Trim and NUL-terminate
+    while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
+    if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
+    decrypted[decryptedLen] = '\0';
+
+    Serial.print("Auth: decrypted ASCII: ");
+    Serial.println(reinterpret_cast<char*>(decrypted));
+
+    // Parse email|password
+    std::string s = reinterpret_cast<char*>(decrypted);
+    size_t sep = s.find('|');
     if (sep == std::string::npos) {
       Serial.println("Auth: bad format — expected email|password");
-      authChar->setValue("AUTH_FAIL");
-      authChar->notify();
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
       delay(200);
       pBLEServer->disconnect(connId);
       return;
     }
 
-    std::string email    = data.substr(0, sep);
-    std::string password = data.substr(sep + 1);
-
+    std::string email = s.substr(0, sep);
+    std::string password = s.substr(sep + 1);
     Serial.printf("Auth attempt — email: %s\n", email.c_str());
 
-    if (checkCredentials(email, password)) {
+    bool ok = checkCredentials(email, password);
+    if (ok) {
       authenticated = true;
       strncpy(connectedUserEmail, email.c_str(), sizeof(connectedUserEmail) - 1);
       connectedUserEmail[sizeof(connectedUserEmail) - 1] = '\0';
-      authChar->setValue("AUTH_OK");
-      authChar->notify();
       Serial.printf("Authentication SUCCESS — user: %s\n", email.c_str());
     } else {
       authenticated = false;
-      authChar->setValue("AUTH_FAIL");
-      authChar->notify();
       Serial.printf("Authentication FAILED — user: %s\n", email.c_str());
-      delay(200);  // allow notify to reach the app before disconnect
+    }
+
+    // Encrypt and send response
+    std::string reply = ok ? "AUTH_OK" : "AUTH_FAIL";
+    std::string outHex;
+    if (encryptAESGCM_packet(reply, outHex)) {
+      authChar->setValue(outHex);
+      authChar->notify();
+      Serial.print("Auth: sent encrypted reply HEX: ");
+      Serial.println(outHex.c_str());
+      Serial.print("Auth: sent encrypted reply ASCII (hex->bin shown as . if nonprintable): ");
+      // print ascii-friendly view of reply hex
+      for (char ch : outHex) Serial.write(ch);
+      Serial.println();
+    } else {
+      Serial.println("Auth: failed to encrypt reply");
+    }
+
+    if (!ok) {
+      delay(200);
       pBLEServer->disconnect(connId);
     }
   }
