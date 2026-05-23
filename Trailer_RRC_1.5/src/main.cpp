@@ -90,29 +90,11 @@ static bool decryptAESGCM_from_bytes(const uint8_t *encrypted, size_t encryptedL
 // forward declare decodeHexText (defined later)
 static bool decodeHexText(const std::string& text, uint8_t *output, size_t outputSize, size_t *outputLen);
 
-static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted, size_t *decryptedLen) {
-  uint8_t buf[256];
-  size_t bufLen = 0;
-
-  // Try hex decode first (incoming text like "00A1...")
-    if (decodeHexText(data, buf, sizeof(buf), &bufLen)) {
-      // Debug: print IV / CIPHER / TAG when receiving hex payload
-      Serial.print("Detected HEX payload — IV=");
-      for (size_t i = 0; i < 12 && i < bufLen; ++i) Serial.printf("%02X", buf[i]);
-      Serial.print(" CIPHER=");
-      size_t cipherStart = 12;
-      size_t cipherEnd = (bufLen >= 16) ? (bufLen - 16) : bufLen;
-      for (size_t i = cipherStart; i < cipherEnd; ++i) Serial.printf("%02X", buf[i]);
-      Serial.print(" TAG=");
-      size_t tagStart = (bufLen >= 16) ? (bufLen - 16) : bufLen;
-      for (size_t i = tagStart; i < bufLen; ++i) Serial.printf("%02X", buf[i]);
-      Serial.println();
-
-      return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedLen);
+static bool decodePayload(const std::string &data, uint8_t *output, size_t outputSize, size_t *outputLen) {
+  if (decodeHexText(data, output, outputSize, outputLen)) {
+    return true;
   }
 
-  // If not hex text, convert each character into its hex representation
-  // e.g. "ABC" -> "414243" then decode that into bytes 0x41,0x42,0x43
   std::string hexed;
   hexed.reserve(data.size() * 2);
   const char hexDigits[] = "0123456789ABCDEF";
@@ -121,14 +103,85 @@ static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted
     hexed.push_back(hexDigits[c & 0xF]);
   }
 
-  if (decodeHexText(hexed, buf, sizeof(buf), &bufLen)) {
-    return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedLen);
+  if (decodeHexText(hexed, output, outputSize, outputLen)) {
+    return true;
   }
 
-  // Fallback: treat raw bytes directly
-  if (data.size() > sizeof(buf)) return false;
-  memcpy(buf, data.data(), data.size());
-  bufLen = data.size();
+  if (data.size() > outputSize) return false;
+  memcpy(output, data.data(), data.size());
+  *outputLen = data.size();
+  return true;
+}
+
+struct SessionCounterEntry {
+  uint64_t sessionId;
+  uint64_t lastCounter;
+  bool used;
+};
+
+static const int MAX_SESSION_COUNTER_ENTRIES = 8;
+static SessionCounterEntry sessionCounters[MAX_SESSION_COUNTER_ENTRIES] = {};
+
+static uint64_t read48be(const uint8_t *buf) {
+  return ((uint64_t)buf[0] << 40) | ((uint64_t)buf[1] << 32) |
+         ((uint64_t)buf[2] << 24) | ((uint64_t)buf[3] << 16) |
+         ((uint64_t)buf[4] << 8)  | (uint64_t)buf[5];
+}
+
+static bool isCounterFresh(uint64_t sessionId, uint64_t counter) {
+  for (int i = 0; i < MAX_SESSION_COUNTER_ENTRIES; ++i) {
+    if (sessionCounters[i].used && sessionCounters[i].sessionId == sessionId) {
+      return counter > sessionCounters[i].lastCounter;
+    }
+  }
+  return true;
+}
+
+static void updateLastCounter(uint64_t sessionId, uint64_t counter) {
+  int freeIndex = -1;
+  int replaceIndex = 0;
+  uint64_t oldestCounter = UINT64_MAX;
+
+  for (int i = 0; i < MAX_SESSION_COUNTER_ENTRIES; ++i) {
+    if (!sessionCounters[i].used) {
+      freeIndex = i;
+      break;
+    }
+    if (sessionCounters[i].sessionId == sessionId) {
+      sessionCounters[i].lastCounter = counter;
+      return;
+    }
+    if (sessionCounters[i].lastCounter < oldestCounter) {
+      oldestCounter = sessionCounters[i].lastCounter;
+      replaceIndex = i;
+    }
+  }
+
+  int target = (freeIndex >= 0) ? freeIndex : replaceIndex;
+  sessionCounters[target].used = true;
+  sessionCounters[target].sessionId = sessionId;
+  sessionCounters[target].lastCounter = counter;
+}
+
+static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted, size_t *decryptedLen) {
+  uint8_t buf[256];
+  size_t bufLen = 0;
+
+  if (!decodePayload(data, buf, sizeof(buf), &bufLen)) {
+    return false;
+  }
+
+  if (bufLen >= 12 + 16) {
+    Serial.print("Detected HEX payload — IV=");
+    for (size_t i = 0; i < 12; ++i) Serial.printf("%02X", buf[i]);
+    Serial.print(" CIPHER=");
+    size_t cipherEnd = bufLen - 16;
+    for (size_t i = 12; i < cipherEnd; ++i) Serial.printf("%02X", buf[i]);
+    Serial.print(" TAG=");
+    for (size_t i = cipherEnd; i < bufLen; ++i) Serial.printf("%02X", buf[i]);
+    Serial.println();
+  }
+
   return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedLen);
 }
 
@@ -539,13 +592,34 @@ class DigitalCallbacks : public BLECharacteristicCallbacks {
     logBLEReceivedData("DIGITAL write received", value);
     if (value.length() < 1) return;
 
+    uint8_t encrypted[256];
+    size_t encryptedLen = 0;
+    if (!decodePayload(value, encrypted, sizeof(encrypted), &encryptedLen)) {
+      Serial.println("Command rejected — unable to decode encrypted payload");
+      return;
+    }
+
+    if (encryptedLen < 12 + 16) {
+      Serial.println("Command rejected — encrypted payload too short");
+      return;
+    }
+
+    uint64_t sessionId = read48be(encrypted);
+    uint64_t counter   = read48be(encrypted + 6);
+    if (!isCounterFresh(sessionId, counter)) {
+      Serial.printf("Command rejected — counter not incremented (session=%012llX counter=%llu)\n", (unsigned long long)sessionId, (unsigned long long)counter);
+      return;
+    }
+
     // Decrypt using AES-GCM (accepts hex text or raw bytes: IV(12) | CIPHER | TAG(16))
     uint8_t decrypted[128];
     size_t decryptedLen = 0;
-    if (!decryptAESGCM_hex_or_raw(value, decrypted, &decryptedLen)) {
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
       Serial.println("DECRYPT FAILED");
       return;
     }
+
+    updateLastCounter(sessionId, counter);
 
     // Trim trailing nulls if any
     while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
