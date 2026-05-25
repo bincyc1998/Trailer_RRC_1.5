@@ -10,7 +10,7 @@
 // -------- BLE user store --------
 #define MAX_USERS 10
 #define MAX_DEVICE_IDS 16
-#define DEVICE_ID_LENGTH 32
+#define DEVICE_ID_LENGTH 41
 
 struct User {
   char name[64];

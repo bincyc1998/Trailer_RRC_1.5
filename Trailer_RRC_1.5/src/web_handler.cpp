@@ -760,7 +760,7 @@ static void handleRoot() {
     html += "<div class='card' style='padding:0;overflow:hidden;'>";
     html += "<div style='padding:18px;'>";
     html += "<div class='form-group'><label>New Device ID</label>";
-    html += "<input type='text' name='device_id' placeholder='Enter device ID to authorize' maxlength='32' required></div>";
+    html += "<input type='text' name='device_id' placeholder='Enter device ID to authorize' maxlength='40' required></div>";
     html += "<div class='form-actions'>";
     html += "<button type='submit' class='btn btn-primary'>&#10003; Register Device ID</button>";
     html += "</div>";
