@@ -432,11 +432,13 @@ static void handleRoot() {
   String defaultTab = "home";
   String activeTab = webServer.hasArg("tab") ? webServer.arg("tab") : defaultTab;
   if (!isAdmin && activeTab == "users") activeTab = "home";
-  if (activeTab != "home" && activeTab != "users" && activeTab != "outconfig" && activeTab != "network") activeTab = defaultTab;
+  if (!isAdmin && activeTab == "deviceids") activeTab = "home";
+  if (activeTab != "home" && activeTab != "users" && activeTab != "outconfig" && activeTab != "network" && activeTab != "deviceids") activeTab = defaultTab;
   bool isHome      = (activeTab == "home");
   bool isUsers     = (activeTab == "users");
   bool isOutConfig = (activeTab == "outconfig");
   bool isNetwork   = (activeTab == "network");
+  bool isDeviceIds = (activeTab == "deviceids");
 
   // Start chunked response immediately so the browser doesn't time out while
   // we build the large HTML string.
@@ -503,6 +505,7 @@ static void handleRoot() {
   html += "<div class='sidebar-item" + String(isHome ? " active" : "") + "' id='nav-home' onclick=\"showTab('home')\"\u003e<span class='sidebar-icon'>&#127968;</span>Home</div>";
   if (isAdmin) {
     html += "<div class='sidebar-item" + String(isUsers ? " active" : "") + "' id='nav-users' onclick=\"showTab('users')\"\u003e<span class='sidebar-icon'>&#128100;</span>User Management</div>";
+    html += "<div class='sidebar-item" + String(isDeviceIds ? " active" : "") + "' id='nav-deviceids' onclick=\"showTab('deviceids')\"\u003e<span class='sidebar-icon'>&#128241;</span>Device IDs</div>";
   }
   if (isAdmin || isOperator) {
     html += "<div class='sidebar-item" + String(isOutConfig ? " active" : "") + "' id='nav-outconfig' onclick=\"showTab('outconfig')\"\u003e<span class='sidebar-icon'>&#9881;</span>Output Config</div>";
@@ -610,7 +613,7 @@ static void handleRoot() {
     html += "<td><span class='badge'>" + String(users[i].role) + "</span></td>";
     html += "<td>";
     html += "<a href='/edit?idx=" + String(i) + "' class='btn btn-edit'>&#9998; Edit</a>&nbsp;";
-    html += "<a href='/confirm-delete?idx=" + String(i) + "' class='btn btn-danger'>Delete</a>&nbsp;";
+    html += "<a href='#' onclick=\"if(confirm('Delete user: " + String(users[i].email) + " ?')){var f=document.createElement('form');f.method='POST';f.action='/delete';var iH=document.createElement('input');iH.type='hidden';iH.name='idx';iH.value='" + String(i) + "';f.appendChild(iH);document.body.appendChild(f);f.submit();}\" class='btn btn-danger'>Delete</a>&nbsp;";
     html += "<a href='/login-as?idx=" + String(i) + "' class='btn btn-outline' title='Login as this user'>&#128100; Login As</a>";
     html += "</td></tr>";
   }
@@ -717,6 +720,54 @@ static void handleRoot() {
     html += "</div>";
     html += "</form>";
     html += "</div>"; // end tab-network
+    mayFlush();
+  }
+
+  if (isAdmin && isDeviceIds) {
+    bool addedOk   = webServer.hasArg("added");
+    bool removedOk = webServer.hasArg("removed");
+    bool dupErr    = webServer.hasArg("err") && webServer.arg("err") == "dup";
+    bool maxErr    = webServer.hasArg("err") && webServer.arg("err") == "max";
+    html += "<div id='tab-deviceids' class='tab-panel active'>";
+    html += "<div class='section-title'>&#128241; Mobile Device IDs</div>";
+    html += "<div class='section-sub'>Register mobile app device IDs allowed to login via BLE.</div>";
+    if (addedOk) {
+      html += "<div class='alert alert-info'>&#10003; Device ID added successfully.</div>";
+    }
+    if (removedOk) {
+      html += "<div class='alert alert-info'>&#10003; Device ID removed.</div>";
+    }
+    if (dupErr) {
+      html += "<div class='alert alert-danger'>&#9888; Device ID already exists.</div>";
+    }
+    if (maxErr) {
+      html += "<div class='alert alert-danger'>&#9888; Maximum number of device IDs reached.</div>";
+    }
+    html += "<div class='table-wrap'>";
+    html += "<table><thead><tr><th width='40'>#</th><th>Device ID</th><th>Actions</th></tr></thead><tbody>";
+    for (int i = 0; i < deviceIdCount; i++) {
+      html += "<tr>";
+      html += "<td>" + String(i + 1) + "</td>";
+      html += "<td>" + String(deviceIds[i]) + "</td>";
+      html += "<td><a href='#' onclick=\"if(confirm('Delete device ID: " + String(deviceIds[i]) + " ?')){var f=document.createElement('form');f.method='POST';f.action='/delete-deviceid';var iH=document.createElement('input');iH.type='hidden';iH.name='idx';iH.value='" + String(i) + "';f.appendChild(iH);document.body.appendChild(f);f.submit();}\" class='btn btn-danger'>Delete</a></td>";
+      html += "</tr>";
+    }
+    if (deviceIdCount == 0) {
+      html += "<tr><td colspan='3' style='text-align:center;color:#90A4AE;padding:20px;'>No authorized device IDs found. Add one below.</td></tr>";
+    }
+    html += "</tbody></table></div>";
+    html += "<form method='POST' action='/deviceids'>";
+    html += "<div class='card' style='padding:0;overflow:hidden;'>";
+    html += "<div style='padding:18px;'>";
+    html += "<div class='form-group'><label>New Device ID</label>";
+    html += "<input type='text' name='device_id' placeholder='Enter device ID to authorize' maxlength='32' required></div>";
+    html += "<div class='form-actions'>";
+    html += "<button type='submit' class='btn btn-primary'>&#10003; Register Device ID</button>";
+    html += "</div>";
+    html += "</div>";
+    html += "</div>";
+    html += "</form>";
+    html += "</div>"; // end tab-deviceids
     mayFlush();
   }
 
@@ -973,6 +1024,8 @@ static void handleConfirmDelete() {
   webServer.send(200, "text/html", html);
 }
 
+// confirmation page for device id removed in favor of JS popup
+
 static void handleDeletePost() {
   if (!webAuthAdmin()) return;
   int idx = webServer.arg("idx").toInt();
@@ -1184,6 +1237,51 @@ static void handleNetConfigPost() {
   ESP.restart();
 }
 
+static void handleDeviceIdsPost() {
+  if (!webAuthAdmin()) return;
+  String deviceId = webServer.arg("device_id");
+  deviceId.trim();
+  if (deviceId.length() == 0) {
+    webServer.send(400, "text/html", errorPage("Device ID cannot be empty.", "/?tab=deviceids"));
+    return;
+  }
+  if (deviceId.length() >= DEVICE_ID_LENGTH) {
+    webServer.send(400, "text/html", errorPage("Device ID is too long.", "/?tab=deviceids"));
+    return;
+  }
+  if (deviceIdCount >= MAX_DEVICE_IDS) {
+    webServer.sendHeader("Location", "/?tab=deviceids&err=max");
+    webServer.send(303);
+    return;
+  }
+  if (deviceIdExists(deviceId)) {
+    webServer.sendHeader("Location", "/?tab=deviceids&err=dup");
+    webServer.send(303);
+    return;
+  }
+  deviceId.toCharArray(deviceIds[deviceIdCount], DEVICE_ID_LENGTH);
+  deviceIdCount++;
+  saveDeviceIds();
+  webServer.sendHeader("Location", "/?tab=deviceids&added=1");
+  webServer.send(303);
+}
+
+static void handleDeleteDeviceId() {
+  if (!webAuthAdmin()) return;
+  int idx = webServer.arg("idx").toInt();
+  if (idx < 0 || idx >= deviceIdCount) {
+    webServer.send(404, "text/html", errorPage("Device ID not found.", "/?tab=deviceids"));
+    return;
+  }
+  for (int i = idx; i < deviceIdCount - 1; i++) {
+    strncpy(deviceIds[i], deviceIds[i + 1], DEVICE_ID_LENGTH);
+  }
+  deviceIdCount--;
+  saveDeviceIds();
+  webServer.sendHeader("Location", "/?tab=deviceids&removed=1");
+  webServer.send(303);
+}
+
 // ============================================================
 //  Motion Status  —  read-only JSON endpoint
 // ============================================================
@@ -1315,6 +1413,8 @@ void setupWebRoutes() {
   webServer.on("/motion/status",  HTTP_GET,  handleMotionStatus);
   webServer.on("/outconfig",      HTTP_POST, handleOutConfigPost);
   webServer.on("/netconfig",      HTTP_POST, handleNetConfigPost);
+  webServer.on("/deviceids",      HTTP_POST, handleDeviceIdsPost);
+  webServer.on("/delete-deviceid", HTTP_POST, handleDeleteDeviceId);
   webServer.begin();
   Serial.println("Web server started");
 }

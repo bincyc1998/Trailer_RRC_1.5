@@ -9,6 +9,8 @@
 
 // -------- BLE user store --------
 #define MAX_USERS 10
+#define MAX_DEVICE_IDS 16
+#define DEVICE_ID_LENGTH 32
 
 struct User {
   char name[64];
@@ -22,6 +24,19 @@ extern User        users[MAX_USERS];
 extern int         userCount;
 extern WebServer   webServer;
 extern Preferences prefs;
+
+extern char        deviceIds[MAX_DEVICE_IDS][DEVICE_ID_LENGTH];
+extern int         deviceIdCount;
+
+// NVS helpers defined in main.cpp, called from web handlers
+void saveUsers();
+void saveOutputConfig();
+void applyOutputConfig();
+void saveNetworkConfig();
+void loadNetworkConfig();
+void loadDeviceIds();
+void saveDeviceIds();
+bool deviceIdExists(const String& deviceId);
 
 
 

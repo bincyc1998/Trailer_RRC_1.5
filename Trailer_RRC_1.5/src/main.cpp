@@ -35,6 +35,8 @@ char wifiPassword[64]  = DEFAULT_WIFI_PASSWORD;
 
 User        users[MAX_USERS];
 int         userCount    = 0;
+char        deviceIds[MAX_DEVICE_IDS][DEVICE_ID_LENGTH];
+int         deviceIdCount = 0;
 Preferences prefs;
 WebServer   webServer(80);
 
@@ -242,6 +244,50 @@ void saveUsers() {
   prefs.end();
 }
 
+void saveDeviceIds() {
+  prefs.begin("deviceids", false);
+  prefs.putInt("count", deviceIdCount);
+  for (int i = 0; i < deviceIdCount; i++) {
+    char key[16];
+    sprintf(key, "id_%d", i);
+    prefs.putString(key, deviceIds[i]);
+  }
+  prefs.end();
+}
+
+void loadDeviceIds() {
+  prefs.begin("deviceids", true);
+  deviceIdCount = prefs.getInt("count", 0);
+  if (deviceIdCount < 0 || deviceIdCount > MAX_DEVICE_IDS) {
+    deviceIdCount = 0;
+  }
+  for (int i = 0; i < deviceIdCount; i++) {
+    char key[16];
+    sprintf(key, "id_%d", i);
+    prefs.getString(key, deviceIds[i], sizeof(deviceIds[i]));
+  }
+  prefs.end();
+}
+
+bool deviceIdExists(const String& deviceId) {
+  if (deviceId.length() == 0) return false;
+  for (int i = 0; i < deviceIdCount; i++) {
+    if (deviceId.equalsIgnoreCase(deviceIds[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool checkCredentials(const std::string& email, const std::string& password) {
+  for (int i = 0; i < userCount; i++) {
+    if (email == users[i].email && password == users[i].password) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void loadUsers() {
   prefs.begin("bleusers", true);
   userCount = prefs.getInt("count", 0);
@@ -398,15 +444,6 @@ static void updateOutputPinsFromState() {
   DOUT(outIdxRight, motionRight ? HIGH : LOW);
 }
 
-bool checkCredentials(const std::string& email, const std::string& password) {
-  for (int i = 0; i < userCount; i++) {
-    if (email == users[i].email && password == users[i].password) {
-      return true;
-    }
-  }
-  return false;
-}
-
 void startWiFi() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(wifiSsid, wifiPassword);
@@ -434,7 +471,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     forceAllOutputsOff();
     Serial.println("Outputs forced OFF until authentication");
 
-    authChar->setValue("AUTH_REQ:email|password");
+    authChar->setValue("AUTH_REQ:email|password|device_id");
     authChar->notify();
   }
 
@@ -465,9 +502,10 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
     }
 
     // Split on '|'
-    size_t sep = data.find('|');
-    if (sep == std::string::npos) {
-      Serial.println("Auth: bad format — expected email|password");
+    size_t sep1 = data.find('|');
+    size_t sep2 = (sep1 == std::string::npos) ? std::string::npos : data.find('|', sep1 + 1);
+    if (sep1 == std::string::npos || sep2 == std::string::npos) {
+      Serial.println("Auth: bad format — expected email|password|device_id");
       authChar->setValue("AUTH_FAIL");
       authChar->notify();
       delay(200);
@@ -475,12 +513,13 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    std::string email    = data.substr(0, sep);
-    std::string password = data.substr(sep + 1);
+    std::string email    = data.substr(0, sep1);
+    std::string password = data.substr(sep1 + 1, sep2 - sep1 - 1);
+    std::string deviceId = data.substr(sep2 + 1);
 
-    Serial.printf("Auth attempt — email: %s\n", email.c_str());
+    Serial.printf("Auth attempt — email: %s device_id: %s\n", email.c_str(), deviceId.c_str());
 
-    if (checkCredentials(email, password)) {
+    if (checkCredentials(email, password) && deviceIdExists(String(deviceId.c_str()))) {
       authenticated = true;
       strncpy(connectedUserEmail, email.c_str(), sizeof(connectedUserEmail) - 1);
       connectedUserEmail[sizeof(connectedUserEmail) - 1] = '\0';
@@ -647,6 +686,7 @@ void setup() {
   Serial.begin(115200);
 
   loadUsers();
+  loadDeviceIds();
   loadOutputConfig();  // reads NVS, applies pinMode + LOW for all 5 outputs
   // Explicitly configure digital outputs and 24V supply pins
   pinMode(Q0_0, OUTPUT);
