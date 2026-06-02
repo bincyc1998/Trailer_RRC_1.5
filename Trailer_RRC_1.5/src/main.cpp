@@ -35,8 +35,6 @@ char wifiPassword[64]  = DEFAULT_WIFI_PASSWORD;
 
 User        users[MAX_USERS];
 int         userCount    = 0;
-char        deviceIds[MAX_DEVICE_IDS][DEVICE_ID_LENGTH];
-int         deviceIdCount = 0;
 Preferences prefs;
 WebServer   webServer(80);
 
@@ -89,32 +87,78 @@ static bool decryptAESGCM_from_bytes(const uint8_t *encrypted, size_t encryptedL
   return true;
 }
 
-// forward declare decodeHexText (defined later)
+// forward declare helpers defined later
 static bool decodeHexText(const std::string& text, uint8_t *output, size_t outputSize, size_t *outputLen);
+static uint64_t read48be(const uint8_t *buf);
+static bool isCounterFresh(uint64_t sessionId, uint64_t counter);
+static void updateLastCounter(uint64_t sessionId, uint64_t counter);
 
-static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted, size_t *decryptedLen) {
-  uint8_t buf[256];
-  size_t bufLen = 0;
+// Global IV counter for encrypting replies (12 bytes)
+static uint8_t replyIvCounter[12] = {0};
 
-  // Try hex decode first (incoming text like "00A1...")
-    if (decodeHexText(data, buf, sizeof(buf), &bufLen)) {
-      // Debug: print IV / CIPHER / TAG when receiving hex payload
-      Serial.print("Detected HEX payload — IV=");
-      for (size_t i = 0; i < 12 && i < bufLen; ++i) Serial.printf("%02X", buf[i]);
-      Serial.print(" CIPHER=");
-      size_t cipherStart = 12;
-      size_t cipherEnd = (bufLen >= 16) ? (bufLen - 16) : bufLen;
-      for (size_t i = cipherStart; i < cipherEnd; ++i) Serial.printf("%02X", buf[i]);
-      Serial.print(" TAG=");
-      size_t tagStart = (bufLen >= 16) ? (bufLen - 16) : bufLen;
-      for (size_t i = tagStart; i < bufLen; ++i) Serial.printf("%02X", buf[i]);
-      Serial.println();
+static void incrementReplyIv() {
+  for (int i = 11; i >= 0; --i) {
+    replyIvCounter[i]++;
+    if (replyIvCounter[i] != 0) break;
+  }
+}
 
-      return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedLen);
+static std::string bytesToHex(const uint8_t *data, size_t len) {
+  static const char hexDigits[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(len * 2);
+  for (size_t i = 0; i < len; ++i) {
+    out.push_back(hexDigits[(data[i] >> 4) & 0xF]);
+    out.push_back(hexDigits[data[i] & 0xF]);
+  }
+  return out;
+}
+
+// Encrypt plaintext into IV(12)|CIPHER|TAG(16) hex string (IV is replyIvCounter, incremented)
+static bool encryptAESGCM_packet(const std::string &plain, std::string &outHex) {
+  size_t len = plain.size();
+  if (len > 200) return false;
+
+  uint8_t ciphertext[256];
+  uint8_t tag[16];
+
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aesKey, 128) != 0) {
+    mbedtls_gcm_free(&gcm);
+    return false;
   }
 
-  // If not hex text, convert each character into its hex representation
-  // e.g. "ABC" -> "414243" then decode that into bytes 0x41,0x42,0x43
+  incrementReplyIv();
+
+  int res = mbedtls_gcm_crypt_and_tag(
+    &gcm,
+    MBEDTLS_GCM_ENCRYPT,
+    len,
+    replyIvCounter, 12,
+    NULL, 0,
+    (const uint8_t*)plain.data(),
+    ciphertext,
+    16,
+    tag
+  );
+
+  mbedtls_gcm_free(&gcm);
+  if (res != 0) return false;
+
+  // Build final hex: IV + ciphertext + tag
+  outHex.clear();
+  outHex += bytesToHex(replyIvCounter, 12);
+  outHex += bytesToHex(ciphertext, len);
+  outHex += bytesToHex(tag, 16);
+  return true;
+}
+
+static bool decodePayload(const std::string &data, uint8_t *output, size_t outputSize, size_t *outputLen) {
+  if (decodeHexText(data, output, outputSize, outputLen)) {
+    return true;
+  }
+
   std::string hexed;
   hexed.reserve(data.size() * 2);
   const char hexDigits[] = "0123456789ABCDEF";
@@ -123,14 +167,112 @@ static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted
     hexed.push_back(hexDigits[c & 0xF]);
   }
 
-  if (decodeHexText(hexed, buf, sizeof(buf), &bufLen)) {
-    return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedLen);
+  if (decodeHexText(hexed, output, outputSize, outputLen)) {
+    return true;
   }
 
-  // Fallback: treat raw bytes directly
-  if (data.size() > sizeof(buf)) return false;
-  memcpy(buf, data.data(), data.size());
-  bufLen = data.size();
+  if (data.size() > outputSize) return false;
+  memcpy(output, data.data(), data.size());
+  *outputLen = data.size();
+  return true;
+}
+
+struct SessionCounterEntry {
+  uint64_t sessionId;
+  uint64_t lastCounter;
+  bool used;
+};
+
+static const int MAX_SESSION_COUNTER_ENTRIES = 8;
+static SessionCounterEntry sessionCounters[MAX_SESSION_COUNTER_ENTRIES] = {};
+
+static uint64_t read48be(const uint8_t *buf) {
+  return ((uint64_t)buf[0] << 40) | ((uint64_t)buf[1] << 32) |
+         ((uint64_t)buf[2] << 24) | ((uint64_t)buf[3] << 16) |
+         ((uint64_t)buf[4] << 8)  | (uint64_t)buf[5];
+}
+
+static bool isCounterFresh(uint64_t sessionId, uint64_t counter) {
+  for (int i = 0; i < MAX_SESSION_COUNTER_ENTRIES; ++i) {
+    if (sessionCounters[i].used && sessionCounters[i].sessionId == sessionId) {
+      return counter > sessionCounters[i].lastCounter;
+    }
+  }
+  return true;
+}
+
+static void updateLastCounter(uint64_t sessionId, uint64_t counter) {
+  int freeIndex = -1;
+  int replaceIndex = 0;
+  uint64_t oldestCounter = UINT64_MAX;
+
+  for (int i = 0; i < MAX_SESSION_COUNTER_ENTRIES; ++i) {
+    if (!sessionCounters[i].used) {
+      freeIndex = i;
+      break;
+    }
+    if (sessionCounters[i].sessionId == sessionId) {
+      sessionCounters[i].lastCounter = counter;
+      return;
+    }
+    if (sessionCounters[i].lastCounter < oldestCounter) {
+      oldestCounter = sessionCounters[i].lastCounter;
+      replaceIndex = i;
+    }
+  }
+
+  int target = (freeIndex >= 0) ? freeIndex : replaceIndex;
+  sessionCounters[target].used = true;
+  sessionCounters[target].sessionId = sessionId;
+  sessionCounters[target].lastCounter = counter;
+}
+
+static bool decryptAndValidateEncryptedPayload(const std::string &value, uint8_t *decrypted, size_t *decryptedLen, uint64_t &sessionId, uint64_t &counter) {
+  uint8_t encrypted[256];
+  size_t encryptedLen = 0;
+
+  if (!decodePayload(value, encrypted, sizeof(encrypted), &encryptedLen)) {
+    return false;
+  }
+
+  if (encryptedLen < 12 + 16) {
+    return false;
+  }
+
+  sessionId = read48be(encrypted);
+  counter   = read48be(encrypted + 6);
+
+  if (!isCounterFresh(sessionId, counter)) {
+    return false;
+  }
+
+  if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, decryptedLen)) {
+    return false;
+  }
+
+  updateLastCounter(sessionId, counter);
+  return true;
+}
+
+static bool decryptAESGCM_hex_or_raw(const std::string &data, uint8_t *decrypted, size_t *decryptedLen) {
+  uint8_t buf[256];
+  size_t bufLen = 0;
+
+  if (!decodePayload(data, buf, sizeof(buf), &bufLen)) {
+    return false;
+  }
+
+  if (bufLen >= 12 + 16) {
+    Serial.print("Detected HEX payload — IV=");
+    for (size_t i = 0; i < 12; ++i) Serial.printf("%02X", buf[i]);
+    Serial.print(" CIPHER=");
+    size_t cipherEnd = bufLen - 16;
+    for (size_t i = 12; i < cipherEnd; ++i) Serial.printf("%02X", buf[i]);
+    Serial.print(" TAG=");
+    for (size_t i = cipherEnd; i < bufLen; ++i) Serial.printf("%02X", buf[i]);
+    Serial.println();
+  }
+
   return decryptAESGCM_from_bytes(buf, bufLen, decrypted, decryptedLen);
 }
 
@@ -174,6 +316,27 @@ static bool decodeHexText(const std::string& text, uint8_t *output, size_t outpu
 
   *outputLen = len;
   return true;
+}
+
+static void logBLEReceivedData(const char *label, const std::string &data) {
+  Serial.printf("%s: length=%u\n", label, (unsigned)data.length());
+  if (data.empty()) return;
+
+  Serial.print("  RAW HEX: ");
+  for (unsigned char c : data) {
+    Serial.printf("%02X", c);
+  }
+  Serial.println();
+
+  Serial.print("  RAW ASCII: ");
+  for (unsigned char c : data) {
+    if (isprint(c)) {
+      Serial.write(c);
+    } else {
+      Serial.print('.');
+    }
+  }
+  Serial.println();
 }
 
 // Current output-to-motion mapping (indices into OUTPUT_PINS[])
@@ -242,50 +405,6 @@ void saveUsers() {
     prefs.putString(rkey, users[i].role);
   }
   prefs.end();
-}
-
-void saveDeviceIds() {
-  prefs.begin("deviceids", false);
-  prefs.putInt("count", deviceIdCount);
-  for (int i = 0; i < deviceIdCount; i++) {
-    char key[16];
-    sprintf(key, "id_%d", i);
-    prefs.putString(key, deviceIds[i]);
-  }
-  prefs.end();
-}
-
-void loadDeviceIds() {
-  prefs.begin("deviceids", true);
-  deviceIdCount = prefs.getInt("count", 0);
-  if (deviceIdCount < 0 || deviceIdCount > MAX_DEVICE_IDS) {
-    deviceIdCount = 0;
-  }
-  for (int i = 0; i < deviceIdCount; i++) {
-    char key[16];
-    sprintf(key, "id_%d", i);
-    prefs.getString(key, deviceIds[i], sizeof(deviceIds[i]));
-  }
-  prefs.end();
-}
-
-bool deviceIdExists(const String& deviceId) {
-  if (deviceId.length() == 0) return false;
-  for (int i = 0; i < deviceIdCount; i++) {
-    if (deviceId.equalsIgnoreCase(deviceIds[i])) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool checkCredentials(const std::string& email, const std::string& password) {
-  for (int i = 0; i < userCount; i++) {
-    if (email == users[i].email && password == users[i].password) {
-      return true;
-    }
-  }
-  return false;
 }
 
 void loadUsers() {
@@ -444,6 +563,15 @@ static void updateOutputPinsFromState() {
   DOUT(outIdxRight, motionRight ? HIGH : LOW);
 }
 
+bool checkCredentials(const std::string& email, const std::string& password) {
+  for (int i = 0; i < userCount; i++) {
+    if (email == users[i].email && password == users[i].password) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void startWiFi() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(wifiSsid, wifiPassword);
@@ -471,7 +599,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     forceAllOutputsOff();
     Serial.println("Outputs forced OFF until authentication");
 
-    authChar->setValue("AUTH_REQ:email|password|device_id");
+    authChar->setValue("AUTH_REQ:email|password|deviceid");
     authChar->notify();
   }
 
@@ -491,47 +619,138 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
 class AuthCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
+    // Accept encrypted auth payload: IV(12) | CIPHER | TAG(16) encoded as hex or raw
     std::string data = pCharacteristic->getValue();
-    Serial.printf("Auth data received: %s\n", data.c_str());
-    if (data.length() < 3) {
-      authChar->setValue("AUTH_FAIL");
-      authChar->notify();
+    logBLEReceivedData("AUTH write received", data);
+
+    if (data.length() < 1) {
+      Serial.println("Auth: empty payload");
+      return;
+    }
+
+    // Decode encrypted packet
+    uint8_t encrypted[512];
+    size_t encryptedLen = 0;
+    if (!decodePayload(data, encrypted, sizeof(encrypted), &encryptedLen)) {
+      Serial.println("Auth: payload decode failed");
+      // Reply encrypted FAIL
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+        Serial.println("Auth: sent AUTH_FAIL (encrypted)");
+      }
       delay(200);
       pBLEServer->disconnect(connId);
       return;
     }
 
-    // Split on '|'
-    size_t sep1 = data.find('|');
-    size_t sep2 = (sep1 == std::string::npos) ? std::string::npos : data.find('|', sep1 + 1);
+    Serial.printf("Auth: decoded encrypted length=%u\n", (unsigned)encryptedLen);
+
+    if (encryptedLen < 12 + 16) {
+      Serial.println("Auth: encrypted payload too short");
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
+      delay(200);
+      pBLEServer->disconnect(connId);
+      return;
+    }
+
+    uint64_t sessionId = read48be(encrypted);
+    uint64_t counter   = read48be(encrypted + 6);
+    Serial.printf("Auth: IV sessionId=%012llX counter=%llu\n", (unsigned long long)sessionId, (unsigned long long)counter);
+
+    if (!isCounterFresh(sessionId, counter)) {
+      Serial.println("Auth: counter replay/stale");
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
+      delay(200);
+      pBLEServer->disconnect(connId);
+      return;
+    }
+
+    uint8_t decrypted[256];
+    size_t decryptedLen = 0;
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
+      Serial.println("Auth: AES-GCM decryption failed");
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
+      delay(200);
+      pBLEServer->disconnect(connId);
+      return;
+    }
+
+    updateLastCounter(sessionId, counter);
+
+    // Trim and NUL-terminate
+    while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
+    if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
+    decrypted[decryptedLen] = '\0';
+
+    Serial.print("Auth: decrypted ASCII: ");
+    Serial.println(reinterpret_cast<char*>(decrypted));
+
+    // Parse email|password|deviceid
+    std::string s = reinterpret_cast<char*>(decrypted);
+    size_t sep1 = s.find('|');
+    size_t sep2 = (sep1 == std::string::npos) ? std::string::npos : s.find('|', sep1 + 1);
     if (sep1 == std::string::npos || sep2 == std::string::npos) {
-      Serial.println("Auth: bad format — expected email|password|device_id");
-      authChar->setValue("AUTH_FAIL");
-      authChar->notify();
+      Serial.println("Auth: bad format — expected email|password|deviceid");
+      std::string outHex;
+      if (encryptAESGCM_packet("AUTH_FAIL", outHex)) {
+        authChar->setValue(outHex);
+        authChar->notify();
+      }
       delay(200);
       pBLEServer->disconnect(connId);
       return;
     }
+    std::string email = s.substr(0, sep1);
+    std::string password = s.substr(sep1 + 1, sep2 - (sep1 + 1));
+    std::string deviceId = s.substr(sep2 + 1);
+    Serial.printf("Auth attempt — email: %s deviceId: %s\n", email.c_str(), deviceId.c_str());
 
-    std::string email    = data.substr(0, sep1);
-    std::string password = data.substr(sep1 + 1, sep2 - sep1 - 1);
-    std::string deviceId = data.substr(sep2 + 1);
-
-    Serial.printf("Auth attempt — email: %s device_id: %s\n", email.c_str(), deviceId.c_str());
-
-    if (checkCredentials(email, password) && deviceIdExists(String(deviceId.c_str()))) {
+    bool okCreds = checkCredentials(email, password);
+    bool okDevice = (deviceId.length() > 0 && deviceId.length() <= 40 && isDeviceRegistered(deviceId.c_str()));
+    bool ok = okCreds && okDevice;
+    if (ok) {
       authenticated = true;
       strncpy(connectedUserEmail, email.c_str(), sizeof(connectedUserEmail) - 1);
       connectedUserEmail[sizeof(connectedUserEmail) - 1] = '\0';
-      authChar->setValue("AUTH_OK");
-      authChar->notify();
-      Serial.printf("Authentication SUCCESS — user: %s\n", email.c_str());
+      Serial.printf("Authentication SUCCESS — user: %s device: %s\n", email.c_str(), deviceId.c_str());
     } else {
       authenticated = false;
-      authChar->setValue("AUTH_FAIL");
+      if (!okCreds) Serial.printf("Authentication FAILED (bad credentials) — user: %s\n", email.c_str());
+      if (!okDevice) Serial.printf("Authentication FAILED (unregistered device) — device: %s\n", deviceId.c_str());
+    }
+
+    // Encrypt and send response
+    std::string reply = ok ? "AUTH_OK" : "AUTH_FAIL";
+    std::string outHex;
+    if (encryptAESGCM_packet(reply, outHex)) {
+      authChar->setValue(outHex);
       authChar->notify();
-      Serial.printf("Authentication FAILED — user: %s\n", email.c_str());
-      delay(200);  // allow notify to reach the app before disconnect
+      Serial.print("Auth: sent encrypted reply HEX: ");
+      Serial.println(outHex.c_str());
+      Serial.print("Auth: sent encrypted reply ASCII (hex->bin shown as . if nonprintable): ");
+      // print ascii-friendly view of reply hex
+      for (char ch : outHex) Serial.write(ch);
+      Serial.println();
+    } else {
+      Serial.println("Auth: failed to encrypt reply");
+    }
+
+    if (!ok) {
+      delay(200);
       pBLEServer->disconnect(connId);
     }
   }
@@ -554,15 +773,37 @@ class DigitalCallbacks : public BLECharacteristicCallbacks {
     }
 
     std::string value = pCharacteristic->getValue();
+    logBLEReceivedData("DIGITAL write received", value);
     if (value.length() < 1) return;
+
+    uint8_t encrypted[256];
+    size_t encryptedLen = 0;
+    if (!decodePayload(value, encrypted, sizeof(encrypted), &encryptedLen)) {
+      Serial.println("Command rejected — unable to decode encrypted payload");
+      return;
+    }
+
+    if (encryptedLen < 12 + 16) {
+      Serial.println("Command rejected — encrypted payload too short");
+      return;
+    }
+
+    uint64_t sessionId = read48be(encrypted);
+    uint64_t counter   = read48be(encrypted + 6);
+    if (!isCounterFresh(sessionId, counter)) {
+      Serial.printf("Command rejected — counter not incremented (session=%012llX counter=%llu)\n", (unsigned long long)sessionId, (unsigned long long)counter);
+      return;
+    }
 
     // Decrypt using AES-GCM (accepts hex text or raw bytes: IV(12) | CIPHER | TAG(16))
     uint8_t decrypted[128];
     size_t decryptedLen = 0;
-    if (!decryptAESGCM_hex_or_raw(value, decrypted, &decryptedLen)) {
+    if (!decryptAESGCM_from_bytes(encrypted, encryptedLen, decrypted, &decryptedLen)) {
       Serial.println("DECRYPT FAILED");
       return;
     }
+
+    updateLastCounter(sessionId, counter);
 
     // Trim trailing nulls if any
     while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
@@ -663,20 +904,29 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
       Serial.println("Heartbeat characteristic received EMPTY data");
       return;
     }
-    
-    //Serial.printf("✓ Heartbeat characteristic RECEIVED: '%s' (length: %d)\n", data.c_str(), data.length());
-    
-    if (data != "HB") {
-      Serial.printf("✗ Invalid heartbeat payload (expected 'HB'): '%s'\n", data.c_str());
+
+    uint8_t decrypted[32];
+    size_t decryptedLen = 0;
+    uint64_t sessionId = 0;
+    uint64_t counter = 0;
+
+    if (!decryptAndValidateEncryptedPayload(data, decrypted, &decryptedLen, sessionId, counter)) {
+      return;
+    }
+
+    // Trim trailing nulls if any
+    while (decryptedLen > 0 && decrypted[decryptedLen - 1] == '\0') decryptedLen--;
+    if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
+    decrypted[decryptedLen] = '\0';
+
+    if (strcmp(reinterpret_cast<char*>(decrypted), "HB") != 0) {
       return;
     }
 
     lastHeartbeatTime = millis();
-    //Serial.printf("✓ Heartbeat received @ %lums\n", lastHeartbeatTime);
     heartbeatMissCount = 0;
     if (!heartbeatAlive) {
       heartbeatAlive = true;
-      Serial.println("Heartbeat restored — outputs enabled if command state allows");
     }
     updateOutputPinsFromState();
   }
@@ -686,7 +936,6 @@ void setup() {
   Serial.begin(115200);
 
   loadUsers();
-  loadDeviceIds();
   loadOutputConfig();  // reads NVS, applies pinMode + LOW for all 5 outputs
   // Explicitly configure digital outputs and 24V supply pins
   pinMode(Q0_0, OUTPUT);

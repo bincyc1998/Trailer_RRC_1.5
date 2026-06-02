@@ -9,8 +9,6 @@
 
 // -------- BLE user store --------
 #define MAX_USERS 10
-#define MAX_DEVICE_IDS 16
-#define DEVICE_ID_LENGTH 41
 
 struct User {
   char name[64];
@@ -19,24 +17,18 @@ struct User {
   char role[32];
 };
 
+// Registered mobile devices
+#define MAX_DEVICES 20
+struct Device {
+  char id[41]; // up to 40 chars + NUL
+  char owner[64]; // optional owner email
+};
+
 // Shared globals defined in main.cpp
 extern User        users[MAX_USERS];
 extern int         userCount;
 extern WebServer   webServer;
 extern Preferences prefs;
-
-extern char        deviceIds[MAX_DEVICE_IDS][DEVICE_ID_LENGTH];
-extern int         deviceIdCount;
-
-// NVS helpers defined in main.cpp, called from web handlers
-void saveUsers();
-void saveOutputConfig();
-void applyOutputConfig();
-void saveNetworkConfig();
-void loadNetworkConfig();
-void loadDeviceIds();
-void saveDeviceIds();
-bool deviceIdExists(const String& deviceId);
 
 
 
@@ -79,3 +71,12 @@ void loadNetworkConfig();
 
 // Web route registration — call once in setup()
 void setupWebRoutes();
+
+// Device registry helpers
+extern Device devices[MAX_DEVICES];
+extern int deviceCount;
+void loadDevices();
+void saveDevices();
+bool isDeviceRegistered(const char* id);
+bool registerDevice(const char* id, const char* owner);
+bool unregisterDevice(const char* id);
