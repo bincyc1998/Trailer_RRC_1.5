@@ -328,15 +328,15 @@ static void logBLEReceivedData(const char *label, const std::string &data) {
   }
   Serial.println();
 
-  Serial.print("  RAW ASCII: ");
-  for (unsigned char c : data) {
-    if (isprint(c)) {
-      Serial.write(c);
-    } else {
-      Serial.print('.');
-    }
-  }
-  Serial.println();
+  // Serial.print("  RAW ASCII: ");
+  // for (unsigned char c : data) {
+  //   if (isprint(c)) {
+  //     Serial.write(c);
+  //   } else {
+  //     Serial.print('.');
+  //   }
+  // }
+  // Serial.println();
 }
 
 // Current output-to-motion mapping (indices into OUTPUT_PINS[])
@@ -621,6 +621,8 @@ class AuthCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     // Accept encrypted auth payload: IV(12) | CIPHER | TAG(16) encoded as hex or raw
     std::string data = pCharacteristic->getValue();
+    Serial.print("////Received AUTH write: ");
+    Serial.println(data.c_str());
     logBLEReceivedData("AUTH write received", data);
 
     if (data.length() < 1) {
@@ -900,6 +902,9 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
     }
 
     std::string data = pCharacteristic->getValue();
+    //logBLEReceivedData("HEARTBEAT write received", data);
+    //Serial.printf("✓ Heartbeat received length=%u\n", (unsigned)data.length());
+    
     if (data.length() == 0) {
       Serial.println("Heartbeat characteristic received EMPTY data");
       return;
@@ -911,6 +916,7 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
     uint64_t counter = 0;
 
     if (!decryptAndValidateEncryptedPayload(data, decrypted, &decryptedLen, sessionId, counter)) {
+      Serial.println("Heartbeat decryption or validation failed");
       return;
     }
 
@@ -919,7 +925,13 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
     if (decryptedLen >= sizeof(decrypted)) decryptedLen = sizeof(decrypted) - 1;
     decrypted[decryptedLen] = '\0';
 
+    //Serial.printf("Heartbeat decrypted: %s (sessionId=%012llX counter=%llu)\n",
+     // reinterpret_cast<char*>(decrypted),
+     // (unsigned long long)sessionId,
+     // (unsigned long long)counter);
+
     if (strcmp(reinterpret_cast<char*>(decrypted), "HB") != 0) {
+      Serial.printf("Heartbeat invalid content: %s\n", reinterpret_cast<char*>(decrypted));
       return;
     }
 
@@ -927,6 +939,7 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
     heartbeatMissCount = 0;
     if (!heartbeatAlive) {
       heartbeatAlive = true;
+      Serial.println("✓ Heartbeat restored — outputs re-enabled");
     }
     updateOutputPinsFromState();
   }
