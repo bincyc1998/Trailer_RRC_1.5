@@ -711,6 +711,9 @@ void setup() {
   pService->start();
 
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  BLEAdvertisementData advertData;
+  advertData.setManufacturerData("PLC14");
+  pAdvertising->setAdvertisementData(advertData);
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->start();
 
