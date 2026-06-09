@@ -9,6 +9,7 @@
 #include <Preferences.h>
 #include "mbedtls/gcm.h"
 #include "web_handler.h"
+#include "esp_gap_ble_api.h"
 
 #define SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define DIGITAL_CHAR_UUID   "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -63,6 +64,18 @@ static const uint8_t aesKey[16] = {
   0x52, 0x43, 0x5F, 0x44,
   0x45, 0x56, 0x5F, 0x31
 };
+
+void updateConnectionParams()
+{
+  esp_ble_conn_update_params_t params;
+
+  params.min_int = 0x06;  
+  params.max_int = 0x06;
+  params.latency = 0;
+  params.timeout = 400;
+
+  esp_ble_gap_update_conn_params(&params);
+}
 
 // AES-GCM decryption helper — accepts either hex text or raw bytes
 static bool decryptAESGCM_from_bytes(const uint8_t *encrypted, size_t encryptedLen, uint8_t *decrypted, size_t *decryptedLen) {
@@ -423,6 +436,7 @@ unsigned long connectTime = 0;
 
 bool          heartbeatAlive     = false;
 unsigned long lastHeartbeatTime  = 0;
+unsigned long lastHeartbeatReceiveTime = 0;
 int           heartbeatMissCount = 0;
 
 
@@ -716,6 +730,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
   // Extended onConnect gives us the connection handle
   void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
     deviceConnected = true;
+    updateConnectionParams();
     authenticated   = false;
     connId          = param->connect.conn_id;
     connectTime     = millis();
@@ -1060,13 +1075,21 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    lastHeartbeatTime = millis();
+    unsigned long now = millis();
+    if (lastHeartbeatReceiveTime != 0) {
+      unsigned long interval = now - lastHeartbeatReceiveTime;
+      Serial.printf("Heartbeat interval: %lu ms\n", interval);
+    } else {
+      Serial.println("Heartbeat interval: first heartbeat");
+    }
+    lastHeartbeatReceiveTime = now;
+    lastHeartbeatTime = now;
     heartbeatMissCount = 0;
     if (!heartbeatAlive) {
       heartbeatAlive = true;
       Serial.println("✓ Heartbeat restored — outputs re-enabled");
     }
-    updateOutputPinsFromState();
+    //updateOutputPinsFromState();
   }
 };
 
@@ -1112,7 +1135,7 @@ void setup() {
   
   digitalChar = pService->createCharacteristic(
     DIGITAL_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE
+    BLECharacteristic::PROPERTY_WRITE_NR
   );
   digitalChar->setCallbacks(new DigitalCallbacks());
 
@@ -1131,7 +1154,7 @@ void setup() {
 
   heartbeatChar = pService->createCharacteristic(
     HEARTBEAT_CHAR_UUID,
-    BLECharacteristic::PROPERTY_WRITE
+    BLECharacteristic::PROPERTY_WRITE_NR
   );
   heartbeatChar->setCallbacks(new HeartbeatCallbacks());
 
